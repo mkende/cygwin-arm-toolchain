@@ -1,0 +1,12 @@
+[submodule "src/binutils"]
+	path = src/binutils
+	url = git://sourceware.org/git/binutils-gdb.git
+	shallow = true
+[submodule "src/gcc"]
+	path = src/gcc
+	url = git://gcc.gnu.org/git/gcc.git
+	shallow = true
+[submodule "src/newlib"]
+	path = src/newlib
+	url = git://sourceware.org/git/newlib-cygwin.git
+	shallow = true
