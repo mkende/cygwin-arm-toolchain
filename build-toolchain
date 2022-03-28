@@ -1,0 +1,109 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Cwd;
+use File::Path 'make_path';
+use File::Spec::Functions 'catdir', 'catfile';
+use File::stat;
+use FindBin;
+use Getopt::Long;
+use Pod::Usage 'pod2usage';
+
+my $base_src_dir = 'src';
+my $base_build_dir = 'build';
+
+my $quiet = 0;   # Suppress the output of the command lines being run.
+my $silent = 0;  # Suppress all output.
+my $help = 0;    # Trigger printing the --help output.
+
+my $help_msg = "cygwin-arm-toolchain/build-toolchain - Build a full embedded ARM toolchain on Windows using Cygwin.\n";
+Getopt::Long::Configure("bundling");
+GetOptions("quiet|q"  => \$quiet,
+           "silent|s" => \$silent,
+           "help|h" => \$help) 
+or pod2usage(-msg => $help_msg, -exitval => 2, -verbose => 0);
+
+pod2usage(-msg => $help_msg, -exitval => 0, -verbose => 1) if $help;
+
+# Let’s chdir into the root directory of the project;
+chdir $FindBin::Bin;
+my $root_dir = cwd();  # After GetOptions to not confuse pod2usage.
+
+# All the project to build, in the order in which they need to be built.
+my @projects = (
+  {
+    name => 'binutils',
+    src_dir => 'binutils',
+    build_dir => 'binutils',
+  },
+);
+
+# compare_file_times($orig, $dest) returns a true value if the file named $orig
+# is more recent than the file named $dest or if $dest does not exist.
+sub compare_file_times {
+  my ($orig, $dest) = @_;
+  die "Cannot find file: $orig\n" unless -e $orig;
+  return 1 unless -e $dest;
+  return stat($orig)->mtime > stat($dest)->mtime;
+}
+
+sub message {
+  my ($msg) = @_;
+  print STDOUT $msg."\n" unless $silent;
+}
+
+# A class that handle building one particular project.
+package Project {
+  # A project is initialized with all the configuration from one entry of the
+  # root %projects list.
+  sub new {
+    my ($class, %conf) = @_;
+    return bless {%conf}, $class;
+  }
+  
+  sub name {
+    my ($this) = @_;
+    return $this->name;    
+  }
+
+  # Returns the directory in which the project should be built. Making sure to
+  # create it first if it does not exist.
+  sub build_dir {
+    my ($this) = @_;
+    my $dir = catdir($root_dir, $base_build_dir, $this->{build_dir});
+    make_path($dir) unless -d $dir;
+    return $dir;
+  }
+  
+  # Call the configure script of the project. We should already be in the proper
+  # directory to build the project.
+  sub configure {
+    my ($this) = @_;
+    message("Makefile is obsolete, running configure script.");
+    
+  }
+}
+
+sub build_project {
+  my ($project) = @_;
+  
+  message("Starting to build ".$project->name.".");
+  
+  chdir $project->build_dir;
+  
+  $project->configure if compare_file_times(catfile($project->source_dir, 'configure'), catfile($project->build_dir, 'Makefile'));
+  $project->build;
+}
+
+__END__
+
+=head1 SYNOPSIS
+
+./build-toolchain [options]
+
+ Options:
+   --quiet    Disable output from executed commands
+   --silent   Disable all output messages
+   --help     Print this help message
