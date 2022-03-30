@@ -4,49 +4,62 @@ use strict;
 use warnings;
 
 use Cwd;
+use File::stat;
+use File::Basename 'fileparse';
+use File::Copy 'copy';
 use File::Path 'make_path';
 use File::Spec::Functions 'catdir', 'catfile';
-use File::stat;
 use FindBin;
 use Getopt::Long;
+use IPC::Cmd;
 use Pod::Usage 'pod2usage';
 
 my $base_src_dir = 'src';
 my $base_build_dir = 'build';
 
-my $quiet = 0;   # Suppress the output of the command lines being run.
-my $silent = 0;  # Suppress all output.
-my $help = 0;    # Trigger printing the --help output.
+# Program behavior
+my $quiet = 0;    # Suppress the output of the command lines being run.
+my $silent = 0;   # Suppress all output.
+my $help = 0;     # Trigger printing the --help output.
+my $dry_run = 0;  # Do not actually execute any commands.
+
+my @skip_projects;
+my @only_projects;
+my $list_projects = 0;  # Causes the program to list the projects and exit.
+my $no_install = 0;
+my $build_here = 0;
+
+# Build behavior
+my $TARGET = 'arm-none-eabi';
+my $PREFIX = '/usr/local';
+my $MAKE_ARGS = '-j4';
 
 my $help_msg = "cygwin-arm-toolchain/build-toolchain - Build a full embedded ARM toolchain on Windows using Cygwin.\n";
 Getopt::Long::Configure("bundling");
-GetOptions("quiet|q"  => \$quiet,
-           "silent|s" => \$silent,
-           "help|h" => \$help) 
+GetOptions("quiet|q"       => \$quiet,
+           "silent|s"      => \$silent,
+           "dry-run|d"     => \$dry_run,
+           "skip=s"        => \@skip_projects,
+           "only=s"        => \@only_projects,
+           "list-projects" => \$list_projects,
+           "no-install"    => \$no_install,
+           "build-here"    => \$build_here,
+           "help|h"        => \$help) 
 or pod2usage(-msg => $help_msg, -exitval => 2, -verbose => 0);
 
+@skip_projects = split(/,/, join(',', @skip_projects));
+@only_projects = split(/,/, join(',', @only_projects));
+
 pod2usage(-msg => $help_msg, -exitval => 0, -verbose => 1) if $help;
+pod2usage(-msg => "--skip and --only are mutually exclusive\n".$help_msg, -exitval => 2, -verbose => 0) if @skip_projects && @only_projects;
 
-# Let’s chdir into the root directory of the project;
-chdir $FindBin::Bin;
-my $root_dir = cwd();  # After GetOptions to not confuse pod2usage.
-
-# All the project to build, in the order in which they need to be built.
-my @projects = (
-  {
-    name => 'binutils',
-    src_dir => 'binutils',
-    build_dir => 'binutils',
-  },
-);
-
-# compare_file_times($orig, $dest) returns a true value if the file named $orig
-# is more recent than the file named $dest or if $dest does not exist.
+# compare_file_times($orig, $dest) returns a true value if the file named $dest
+# is more recent than the file named $orig.
 sub compare_file_times {
   my ($orig, $dest) = @_;
   die "Cannot find file: $orig\n" unless -e $orig;
-  return 1 unless -e $dest;
-  return stat($orig)->mtime > stat($dest)->mtime;
+  return 0 unless -e $dest;
+  return stat($orig)->mtime < stat($dest)->mtime;
 }
 
 sub message {
@@ -54,8 +67,181 @@ sub message {
   print STDOUT $msg."\n" unless $silent;
 }
 
+sub execute {
+  my (@cmd) = @_;
+  message(join(' ', @cmd));
+  return if $dry_run;
+  return if IPC::Cmd::run(command => \@cmd, verbose => !($quiet || $silent));
+  die "Failed executing: ".join(' ', @cmd)."\n";
+}
+
+sub copy_file {
+  my ($from, $to) = @_;
+  message("cp '$from' '$to'");
+  return if $dry_run;
+  my (undef, $dest_dir, undef) = fileparse($to);
+  make_path($dest_dir) unless -d $dest_dir;
+  copy($from, $to);
+}
+
+my $root_src_dir = catdir($FindBin::Bin, $base_src_dir);
+my $root_build_dir;
+if ($build_here) {
+  $root_build_dir = catdir(cwd(), $base_build_dir);
+} else {
+  $root_build_dir = catdir($FindBin::Bin, $base_build_dir);  
+}
+
+my @common_configure_args = (
+  "--target=${TARGET}",
+  "--prefix=${PREFIX}",
+);
+
+# All the project to build, in the order in which they need to be built.
+my @projects = (
+  {
+    name => 'binutils',
+    configure_args => [qw(
+      --disable-nls
+      --disable-libquadmath
+    )],
+  },
+  # Documentation for the GCC configure options:
+  # https://gcc.gnu.org/install/configure.html
+  {
+    name => 'gcc-bootstrap',
+    src_dir => 'gcc',
+    configure_args => [qw(
+      --with-cpu=cortex-m0plus
+      --with-fpu=auto
+      --with-float=soft
+      --with-mode=thumb
+      --enable-interwork
+      --enable-multilib
+      --enable-languages=c
+      --with-system-zlib
+      --with-newlib
+      --without-headers
+      --disable-shared
+      --disable-nls
+      --with-gnu-as
+      --with-gnu-ld
+    )],
+  },
+  {
+    name => 'newlib',
+    # Documentation for all the newlib configuration options:
+    # https://sourceware.org/newlib/README
+    #
+    # There is no universal agreement on the best set of options to use here.
+    # The one included by default are the most common ones.
+    configure_args => [qw(
+      --enable-interwork \
+      --enable-multilib \
+      --disable-nls \
+      --disable-newlib-supplied-syscalls \
+      --enable-newlib-io-long-long \
+      --enable-newlib-register-fini \
+      --enable-newlib-retargetable-locking
+    ),
+      'CFLAGS=-g -O2 -ffunction-sections -fdata-sections',
+    ],
+    # Other options used by one toolchain or another:
+    # --enable-newlib-io-c99-formats
+    # --enable-newlib-reent-check-verify
+    # --enable-newlib-reent-small
+    # --disable-newlib-fvwrite-in-streamio
+    # --disable-newlib-fseek-optimization
+    # --disable-newlib-wide-orient
+    # --disable-newlib-unbuf-stream-opt
+    # --enable-newlib-global-atexit
+    # --enable-newlib-global-stdio-streams
+    #
+    # Sources for these options:
+    # https://stackoverflow.com/questions/50154137
+    # https://sourceware.org/newlib/faq.html#q4
+    # From https://github.com/FreddieChopin/bleeding-edge-toolchain/blob/master/build-bleeding-edge-toolchain.sh
+    # The source code of the toolchain distributed on arm.com
+    # The rules script in the newlib-arm-non-eabi Debian package.
+  },
+  {
+    name => 'gcc',
+    src_dir => 'gcc',
+    configure_args => [qw(
+      --with-cpu=cortex-m0plus
+      --with-fpu=auto
+      --with-float=soft
+      --with-mode=thumb
+      --enable-interwork
+      --enable-multilib),
+      '--enable-languages=c,c++',  # The comma raise a warning inside qw.
+      qw(--with-system-zlib
+      --with-newlib
+      --disable-shared
+      --disable-nls
+      --with-gnu-as
+      --with-gnu-ld
+    )],
+  },
+  {
+    name => 'newlib-nano',
+    src_dir => 'newlib',
+    # There seems to be a much more common approach to the standard configure
+    # flags passed for the "nano" version of newlib.
+    configure_args => [qw(
+      --enable-interwork
+      --enable-multilib
+      --disable-newlib-supplied-syscalls
+      --enable-newlib-reent-small
+      --disable-newlib-fvwrite-in-streamio
+      --disable-newlib-fseek-optimization
+      --disable-newlib-wide-orient
+      --enable-newlib-nano-malloc
+      --disable-newlib-unbuf-stream-opt
+      --enable-lite-exit
+      --enable-newlib-global-atexit
+      --enable-newlib-nano-formatted-io
+      --disable-nls
+    ),
+      'CFLAGS=-g -DPREFER_SIZE_OVER_SPEED=1 -Os -ffunction-sections -fdata-sections -fshort-wchar',
+    ],
+    # The package distributed by ARM also uses the following flags:
+    # --enable-newlib-reent-check-verify
+    # --enable-newlib-retargetable-locking
+    install => sub {
+      my ($build_dir) = @_;
+      my ($ok, $error, undef, $stdout, undef) =
+          IPC::Cmd::run(command => [qw(arm-none-eabi-gcc -print-multi-lib)]);
+      die "Cannot get multi-lib configuration from gcc: ${error}\n" unless $ok;
+      # $stdout is an array but each entry can contain multiple lines of output.
+      for my $multilib (map { m/^(.*);/gm; } @$stdout) {
+        my $src_dir = catdir($build_dir, $TARGET, $multilib);
+        my $dest_dir = catdir($PREFIX, $TARGET, "lib", $multilib);
+        copy_file(catfile($src_dir, 'newlib', 'libc.a'), catfile($dest_dir, 'libc_nano.a'));
+        copy_file(catfile($src_dir, 'newlib', 'libg.a'), catfile($dest_dir, 'libg_nano.a'));
+        copy_file(catfile($src_dir, 'newlib', 'libm.a'), catfile($dest_dir, 'libm_nano.a'));
+        copy_file(catfile($src_dir, 'libgloss', 'arm', 'librdimon.a'), catfile($dest_dir, 'librdimon_nano.a'));
+        copy_file(catfile($src_dir, 'libgloss', 'arm', 'librdpmon.a'), catfile($dest_dir, 'librdpmon_nano.a'));
+        copy_file(catfile($src_dir, 'libgloss', 'arm', 'semihv2m', 'librdimon.a'), catfile($dest_dir, 'librdimon-v2m_nano.a'));
+        copy_file(catfile($src_dir, 'libgloss', 'arm', 'semihv2m', 'librdpmon.a'), catfile($dest_dir, 'librdpmon-v2m_nano.a'));
+      }
+      # Some system put the file in nano/newlib.h instead, but anyway I don’t
+      # think that this file is usually used.
+      copy_file(catfile($build_dir, $TARGET, 'newlib', 'include.h'), catfile($PREFIX, $TARGET, 'include', 'newlib-nano', 'newlib.h'));
+    },
+  },
+);
+
+if ($list_projects) {
+  print 'Projects: '.join(' ', map { $_->{name} } @projects )."\n";
+  exit 0;
+}
+
 # A class that handle building one particular project.
 package Project {
+  use File::Path 'make_path';
+  use File::Spec::Functions 'catdir', 'catfile';
+
   # A project is initialized with all the configuration from one entry of the
   # root %projects list.
   sub new {
@@ -65,36 +251,68 @@ package Project {
   
   sub name {
     my ($this) = @_;
-    return $this->name;    
+    return $this->{name};    
   }
 
   # Returns the directory in which the project should be built. Making sure to
   # create it first if it does not exist.
   sub build_dir {
     my ($this) = @_;
-    my $dir = catdir($root_dir, $base_build_dir, $this->{build_dir});
+    my $dir = catdir($root_build_dir, $this->{name});
     make_path($dir) unless -d $dir;
     return $dir;
   }
+
+  sub src_dir {
+    my ($this) = @_;
+    return catdir($root_src_dir, $this->{src_dir} // $this->{name});
+  }
   
   # Call the configure script of the project. We should already be in the proper
-  # directory to build the project.
-  sub configure {
+  # directory to build the project. This is skipped if our Makefile is more
+  # recent than the configure script.
+  sub maybe_configure {
     my ($this) = @_;
-    message("Makefile is obsolete, running configure script.");
-    
+    my $configure = catfile($this->src_dir, 'configure');
+    return if ::compare_file_times($configure, catfile($this->build_dir, 'Makefile'));
+    ::message("Makefile is obsolete, running configure script.");
+    ::execute($configure, @common_configure_args, @{$this->{configure_args}});
+  }
+
+  sub make {
+    my ($this) = @_;
+    ::execute('make', $MAKE_ARGS, 'all');    
+  }
+  
+  sub install {
+    my ($this) = @_;
+    if (exists $this->{install}) {
+      $this->{install}->($this->build_dir);
+    } else {
+      ::execute('make', 'install');
+    }
   }
 }
 
 sub build_project {
   my ($project) = @_;
   
-  message("Starting to build ".$project->name.".");
+  message("Starting to build ".$project->name." in ".$project->build_dir);
   
   chdir $project->build_dir;
   
-  $project->configure if compare_file_times(catfile($project->source_dir, 'configure'), catfile($project->build_dir, 'Makefile'));
-  $project->build;
+  $project->maybe_configure;
+  $project->make;
+  $project->install unless $no_install;
+}
+
+my %skip_projects = map { $_ => 1 } @skip_projects;
+my %only_projects = map { $_ => 1 } @only_projects;
+for my $p (@projects) {
+  my $project = Project->new(%$p);
+  next if $skip_projects{$project->name};
+  next if @only_projects && !$only_projects{$project->name};  
+  build_project(Project->new(%$p));
 }
 
 __END__
@@ -106,4 +324,14 @@ __END__
  Options:
    --quiet    Disable output from executed commands
    --silent   Disable all output messages
-   --help     Print this help message
+   --dry-run  Do not execute any command
+
+   --skip [project,...]  Do not build the specified projects
+   --only [projects,...] Build only the specified projects
+   --list-projects       Lists the projects and exit
+   --no-install          Do not install the projects, may fail to build
+                         some project
+   --build-here          Build in the current directory instead of in a "build"
+                         subdirectory of the cygwin-arm-toolchain tool.
+ 
+   --help     Print this help message and exit
