@@ -27,6 +27,8 @@ my @skip_projects;
 my @only_projects;
 my $list_projects = 0;  # Causes the program to list the projects and exit.
 my $no_install = 0;
+my $reconfigure = 0;
+my $force = 0;
 my $build_here = 0;
 
 # Build behavior
@@ -43,6 +45,8 @@ GetOptions("quiet|q"       => \$quiet,
            "only=s"        => \@only_projects,
            "list-projects" => \$list_projects,
            "no-install"    => \$no_install,
+           "reconfigure"   => \$reconfigure,
+           "force"         => \$force,
            "build-here"    => \$build_here,
            "help|h"        => \$help) 
 or pod2usage(-msg => $help_msg, -exitval => 2, -verbose => 0);
@@ -97,6 +101,8 @@ my @common_configure_args = (
   "--prefix=${PREFIX}",
 );
 
+my %built_project; 
+
 # All the project to build, in the order in which they need to be built.
 my @projects = (
   {
@@ -113,7 +119,6 @@ my @projects = (
     src_dir => 'gcc',
     configure_args => [qw(
       --with-cpu=cortex-m0plus
-      --with-fpu=auto
       --with-float=soft
       --with-mode=thumb
       --enable-interwork
@@ -127,8 +132,13 @@ my @projects = (
       --with-gnu-as
       --with-gnu-ld
     )],
+    condition => sub {
+      return !IPC::Cmd::can_run($TARGET.'-gcc')
+    },
   },
   {
+    # NOTE: If you edit this project you probably want to edit the newlib-final
+    # one too.
     name => 'newlib',
     # Documentation for all the newlib configuration options:
     # https://sourceware.org/newlib/README
@@ -136,12 +146,12 @@ my @projects = (
     # There is no universal agreement on the best set of options to use here.
     # The one included by default are the most common ones.
     configure_args => [qw(
-      --enable-interwork \
-      --enable-multilib \
-      --disable-nls \
-      --disable-newlib-supplied-syscalls \
-      --enable-newlib-io-long-long \
-      --enable-newlib-register-fini \
+      --enable-interwork
+      --enable-multilib
+      --disable-nls
+      --disable-newlib-supplied-syscalls
+      --enable-newlib-io-long-long
+      --enable-newlib-register-fini
       --enable-newlib-retargetable-locking
     ),
       'CFLAGS=-g -O2 -ffunction-sections -fdata-sections',
@@ -169,7 +179,6 @@ my @projects = (
     src_dir => 'gcc',
     configure_args => [qw(
       --with-cpu=cortex-m0plus
-      --with-fpu=auto
       --with-float=soft
       --with-mode=thumb
       --enable-interwork
@@ -230,6 +239,24 @@ my @projects = (
       copy_file(catfile($build_dir, $TARGET, 'newlib', 'include.h'), catfile($PREFIX, $TARGET, 'include', 'newlib-nano', 'newlib.h'));
     },
   },
+  {
+    name => 'newlib-final',
+    src_dir => 'newlib',
+    configure_args => [qw(
+      --enable-interwork
+      --enable-multilib
+      --disable-nls
+      --disable-newlib-supplied-syscalls
+      --enable-newlib-io-long-long
+      --enable-newlib-register-fini
+      --enable-newlib-retargetable-locking
+    ),
+      'CFLAGS=-g -O2 -ffunction-sections -fdata-sections',
+    ],
+    condition => sub {
+      return !$built_project{'gcc-bootstrap'};
+    },
+  },
 );
 
 if ($list_projects) {
@@ -268,14 +295,23 @@ package Project {
     return catdir($root_src_dir, $this->{src_dir} // $this->{name});
   }
   
+  sub should_build {
+    my ($this) = @_;
+    return 1 if $force;
+    return 1 unless exists $this->{condition};
+    return $this->{condition}->();
+  }
+  
   # Call the configure script of the project. We should already be in the proper
   # directory to build the project. This is skipped if our Makefile is more
   # recent than the configure script.
   sub maybe_configure {
     my ($this) = @_;
     my $configure = catfile($this->src_dir, 'configure');
-    return if ::compare_file_times($configure, catfile($this->build_dir, 'Makefile'));
-    ::message("Makefile is obsolete, running configure script.");
+    if (!$reconfigure) {
+      return if ::compare_file_times($configure, catfile($this->build_dir, 'Makefile'));
+      ::message("Makefile is obsolete, running configure script.");
+    }
     ::execute($configure, @common_configure_args, @{$this->{configure_args}});
   }
 
@@ -308,12 +344,18 @@ sub build_project {
 
 my %skip_projects = map { $_ => 1 } @skip_projects;
 my %only_projects = map { $_ => 1 } @only_projects;
+my %all_projects = map { $_->{name} => 1 } @projects;
+my @unknown_projects = grep { !$all_projects{$_} } @skip_projects, @only_projects;
+die 'Unknown projects: '.join(', ', @unknown_projects)."\n" if @unknown_projects;
 for my $p (@projects) {
   my $project = Project->new(%$p);
   next if $skip_projects{$project->name};
-  next if @only_projects && !$only_projects{$project->name};  
-  build_project(Project->new(%$p));
+  next if @only_projects && !$only_projects{$project->name};
+  next unless $project->should_build();
+  build_project($project);
+  $built_project{$project->name} = 1;
 }
+message "Success";
 
 __END__
 
@@ -331,6 +373,10 @@ __END__
    --list-projects       Lists the projects and exit
    --no-install          Do not install the projects, may fail to build
                          some project
+   --reconfigure         Always run the configure scripts
+   --force               Build the projects that would be conditionnnaly skipped
+                         (this does not bypass the effect of the --skip and
+                         --only flags)
    --build-here          Build in the current directory instead of in a "build"
                          subdirectory of the cygwin-arm-toolchain tool.
  
